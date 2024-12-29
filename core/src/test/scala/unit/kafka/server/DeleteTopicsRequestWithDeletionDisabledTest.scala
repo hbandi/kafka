@@ -17,22 +17,30 @@
 
 package kafka.server
 
-import kafka.network.SocketServer
+import java.util.Collections
 import kafka.utils._
 import org.apache.kafka.common.message.DeleteTopicsRequestData
-import org.apache.kafka.common.protocol.{ApiKeys, Errors}
+import org.apache.kafka.common.network.ListenerName
+import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.{DeleteTopicsRequest, DeleteTopicsResponse}
-import org.junit.Assert._
-import org.junit.Test
-
-import java.util.Collections
+import org.apache.kafka.server.config.ServerConfigs
+import org.junit.jupiter.api.Assertions._
+import org.junit.jupiter.api.TestInfo
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 
 class DeleteTopicsRequestWithDeletionDisabledTest extends BaseRequestTest {
 
   override def brokerCount: Int = 1
 
+  override def kraftControllerConfigs(testInfo: TestInfo) = {
+    val props = super.kraftControllerConfigs(testInfo)
+    props.head.setProperty(ServerConfigs.DELETE_TOPIC_ENABLE_CONFIG, "false")
+    props
+  }
+
   override def generateConfigs = {
-    val props = TestUtils.createBrokerConfigs(brokerCount, zkConnect,
+    val props = TestUtils.createBrokerConfigs(brokerCount, null,
       enableControlledShutdown = false, enableDeleteTopic = false,
       interBrokerSecurityProtocol = Some(securityProtocol),
       trustStoreFile = trustStoreFile, saslProperties = serverSaslProperties, logDirCount = logDirCount)
@@ -40,8 +48,9 @@ class DeleteTopicsRequestWithDeletionDisabledTest extends BaseRequestTest {
     props.map(KafkaConfig.fromProps)
   }
 
-  @Test
-  def testDeleteRecordsRequest() {
+  @ParameterizedTest
+  @ValueSource(strings = Array("kraft"))
+  def testDeleteRecordsRequest(quorum: String): Unit = {
     val topic = "topic-1"
     val request = new DeleteTopicsRequest.Builder(
         new DeleteTopicsRequestData()
@@ -58,9 +67,12 @@ class DeleteTopicsRequestWithDeletionDisabledTest extends BaseRequestTest {
     assertEquals(Errors.INVALID_REQUEST.code, v2response.data.responses.find(topic).errorCode)
   }
 
-  private def sendDeleteTopicsRequest(request: DeleteTopicsRequest, socketServer: SocketServer = controllerSocketServer): DeleteTopicsResponse = {
-    val response = connectAndSend(request, ApiKeys.DELETE_TOPICS, socketServer)
-    DeleteTopicsResponse.parse(response, request.version)
+  private def sendDeleteTopicsRequest(request: DeleteTopicsRequest): DeleteTopicsResponse = {
+    connectAndReceive[DeleteTopicsResponse](
+      request,
+      controllerSocketServer,
+      ListenerName.normalised("CONTROLLER")
+    )
   }
 
 }

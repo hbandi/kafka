@@ -17,7 +17,7 @@
 
 package kafka.coordinator.group
 
-import kafka.server.DelayedOperation
+import org.apache.kafka.server.purgatory.DelayedOperation
 
 /**
  * Delayed heartbeat operations that are added to the purgatory for session timeout checking.
@@ -27,11 +27,10 @@ private[group] class DelayedHeartbeat(coordinator: GroupCoordinator,
                                       group: GroupMetadata,
                                       memberId: String,
                                       isPending: Boolean,
-                                      deadline: Long,
                                       timeoutMs: Long)
-  extends DelayedOperation(timeoutMs, Some(group.lock)) {
+  extends DelayedOperation(timeoutMs, group.lock) {
 
-  override def tryComplete(): Boolean = coordinator.tryCompleteHeartbeat(group, memberId, isPending, deadline, forceComplete _)
-  override def onExpiration() = coordinator.onExpireHeartbeat(group, memberId, isPending, deadline)
-  override def onComplete() = coordinator.onCompleteHeartbeat()
+  override def tryComplete(): Boolean = coordinator.tryCompleteHeartbeat(group, memberId, isPending, forceComplete _)
+  override def onExpiration(): Unit = coordinator.onExpireHeartbeat(group, memberId, isPending)
+  override def onComplete(): Unit = {}
 }

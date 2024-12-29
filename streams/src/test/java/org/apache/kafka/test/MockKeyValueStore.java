@@ -18,9 +18,12 @@ package org.apache.kafka.test;
 
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.IntegerDeserializer;
-import org.apache.kafka.streams.processor.ProcessorContext;
+import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.processor.StateRestoreCallback;
 import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.query.Position;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.KeyValueStore;
 
@@ -28,7 +31,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class MockKeyValueStore implements KeyValueStore {
+public class MockKeyValueStore implements KeyValueStore<Object, Object> {
     // keep a global counter of flushes and a local reference to which store had which
     // flush, so we can reason about the order in which stores get flushed.
     private static final AtomicInteger GLOBAL_FLUSH_COUNTER = new AtomicInteger(0);
@@ -54,9 +57,9 @@ public class MockKeyValueStore implements KeyValueStore {
     }
 
     @Override
-    public void init(final ProcessorContext context,
+    public void init(final StateStoreContext stateStoreContext,
                      final StateStore root) {
-        context.register(root, stateRestoreCallback);
+        stateStoreContext.register(root, stateRestoreCallback);
         initialized = true;
         closed = false;
     }
@@ -86,6 +89,11 @@ public class MockKeyValueStore implements KeyValueStore {
         return !closed;
     }
 
+    @Override
+    public Position getPosition() {
+        throw new UnsupportedOperationException("Position handling not implemented");
+    }
+
     public final StateRestoreCallback stateRestoreCallback = new StateRestoreCallback() {
         private final Deserializer<Integer> deserializer = new IntegerDeserializer();
 
@@ -98,9 +106,7 @@ public class MockKeyValueStore implements KeyValueStore {
     };
 
     @Override
-    public void put(final Object key, final Object value) {
-
-    }
+    public void put(final Object key, final Object value) {}
 
     @Override
     public Object putIfAbsent(final Object key, final Object value) {
@@ -113,9 +119,7 @@ public class MockKeyValueStore implements KeyValueStore {
     }
 
     @Override
-    public void putAll(final List entries) {
-
-    }
+    public void putAll(final List<KeyValue<Object, Object>> entries) {}
 
     @Override
     public Object get(final Object key) {
@@ -123,12 +127,17 @@ public class MockKeyValueStore implements KeyValueStore {
     }
 
     @Override
-    public KeyValueIterator range(final Object from, final Object to) {
+    public KeyValueIterator<Object, Object> range(final Object from, final Object to) {
         return null;
     }
 
     @Override
-    public KeyValueIterator all() {
+    public <PS extends Serializer<P>, P> KeyValueIterator<Object, Object> prefixScan(P prefix, PS prefixKeySerializer) {
+        return null;
+    }
+
+    @Override
+    public KeyValueIterator<Object, Object> all() {
         return null;
     }
 

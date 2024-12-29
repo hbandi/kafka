@@ -20,6 +20,7 @@ import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.annotation.InterfaceStability;
 
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -40,7 +41,9 @@ public class DeleteConsumerGroupsResult {
      * individual deletions.
      */
     public Map<String, KafkaFuture<Void>> deletedGroups() {
-        return futures;
+        Map<String, KafkaFuture<Void>> deletedGroups = new HashMap<>(futures.size());
+        deletedGroups.putAll(futures);
+        return deletedGroups;
     }
 
     /**

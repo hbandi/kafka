@@ -17,65 +17,90 @@
 
 package kafka.utils
 
+import org.apache.kafka.common.utils.Utils
+import org.apache.logging.log4j.core.LoggerContext
+import org.apache.logging.log4j.core.config.Configurator
+import org.apache.logging.log4j.{Level, LogManager}
+
 import java.util
 import java.util.Locale
-
-import org.apache.log4j.{Level, LogManager, Logger}
-
-import scala.collection.mutable
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 
 object Log4jController {
+
+  /**
+   * Note: In log4j, the root logger's name was "root" and Kafka also followed that name for dynamic logging control feature.
+   *
+   * The root logger's name is changed in log4j2 to empty string (see: [[LogManager.ROOT_LOGGER_NAME]]) but for backward-
+   * compatibility. Kafka keeps its original root logger name. It is why here is a dedicated definition for the root logger name.
+   */
   val ROOT_LOGGER = "root"
 
   /**
-    * Returns a map of the log4j loggers and their assigned log level.
-    * If a logger does not have a log level assigned, we return the root logger's log level
-    */
-  def loggers: mutable.Map[String, String] = {
-    val logs = new mutable.HashMap[String, String]()
-    val rootLoggerLvl = existingLogger(ROOT_LOGGER).getLevel.toString
-    logs.put(ROOT_LOGGER, rootLoggerLvl)
+   * Returns a map of the log4j loggers and their assigned log level.
+   * If a logger does not have a log level assigned, we return the log level of the first ancestor with a level configured.
+   */
+  def loggers: Map[String, String] = {
+    val logContext = LogManager.getContext(false).asInstanceOf[LoggerContext]
+    val rootLoggerLevel = logContext.getRootLogger.getLevel.toString
 
-    val loggers = LogManager.getCurrentLoggers
-    while (loggers.hasMoreElements) {
-      val logger = loggers.nextElement().asInstanceOf[Logger]
-      if (logger != null) {
-        val level = if (logger.getLevel != null) logger.getLevel.toString else rootLoggerLvl
-        logs.put(logger.getName, level)
-      }
-    }
-    logs
+    // Loggers defined in the configuration
+    val configured = logContext.getConfiguration.getLoggers.asScala
+      .values
+      .filterNot(_.getName.equals(LogManager.ROOT_LOGGER_NAME))
+      .map { logger =>
+        logger.getName -> logger.getLevel.toString
+      }.toMap
+
+    // Loggers actually running
+    val actual = logContext.getLoggers.asScala
+      .filterNot(_.getName.equals(LogManager.ROOT_LOGGER_NAME))
+      .map { logger =>
+        logger.getName -> logger.getLevel.toString
+      }.toMap
+
+    (configured ++ actual) + (ROOT_LOGGER -> rootLoggerLevel)
   }
 
   /**
-    * Sets the log level of a particular logger
-    */
+   * Sets the log level of a particular logger. If the given logLevel is not an available log4j level
+   * (i.e., one of OFF, FATAL, ERROR, WARN, INFO, DEBUG, TRACE, ALL) it falls back to DEBUG.
+   *
+   * @see [[Level.toLevel]]
+   */
   def logLevel(loggerName: String, logLevel: String): Boolean = {
-    val log = existingLogger(loggerName)
-    if (!loggerName.trim.isEmpty && !logLevel.trim.isEmpty && log != null) {
-      log.setLevel(Level.toLevel(logLevel.toUpperCase(Locale.ROOT)))
+    if (Utils.isBlank(loggerName) || Utils.isBlank(logLevel))
+      return false
+
+    val level = Level.toLevel(logLevel.toUpperCase(Locale.ROOT))
+
+    if (loggerName == ROOT_LOGGER) {
+      Configurator.setAllLevels(LogManager.ROOT_LOGGER_NAME, level)
       true
+    } else {
+      if (loggerExists(loggerName) && level != null) {
+        Configurator.setAllLevels(loggerName, level)
+        true
+      }
+      else false
     }
-    else false
   }
 
   def unsetLogLevel(loggerName: String): Boolean = {
-    val log = existingLogger(loggerName)
-    if (!loggerName.trim.isEmpty && log != null) {
-      log.setLevel(null)
+    if (loggerName == ROOT_LOGGER) {
+      Configurator.setAllLevels(LogManager.ROOT_LOGGER_NAME, null)
       true
+    } else {
+      if (loggerExists(loggerName)) {
+        Configurator.setAllLevels(loggerName, null)
+        true
+      }
+      else false
     }
-    else false
   }
 
-  def loggerExists(loggerName: String): Boolean = existingLogger(loggerName) != null
-
-  private def existingLogger(loggerName: String) =
-    if (loggerName == ROOT_LOGGER)
-      LogManager.getRootLogger
-    else LogManager.exists(loggerName)
+  def loggerExists(loggerName: String): Boolean = loggers.contains(loggerName)
 }
 
 /**
@@ -87,22 +112,15 @@ object Log4jController {
 class Log4jController extends Log4jControllerMBean {
 
   def getLoggers: util.List[String] = {
-    Log4jController.loggers.map {
+    // we replace scala collection by java collection so mbean client is able to deserialize it without scala library.
+    new util.ArrayList[String](Log4jController.loggers.map {
       case (logger, level) => s"$logger=$level"
-    }.toList.asJava
+    }.toSeq.asJava)
   }
 
 
   def getLogLevel(loggerName: String): String = {
-    val log = Log4jController.existingLogger(loggerName)
-    if (log != null) {
-      val level = log.getLevel
-      if (level != null)
-        log.getLevel.toString
-      else
-        Log4jController.existingLogger(Log4jController.ROOT_LOGGER).getLevel.toString
-    }
-    else "No such logger."
+    Log4jController.loggers.getOrElse(loggerName, "No such logger.")
   }
 
   def setLogLevel(loggerName: String, level: String): Boolean = Log4jController.logLevel(loggerName, level)

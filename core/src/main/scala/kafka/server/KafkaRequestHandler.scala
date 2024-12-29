@@ -17,33 +17,91 @@
 
 package kafka.server
 
-import kafka.network._
-import kafka.utils._
-import kafka.metrics.KafkaMetricsGroup
+import kafka.network.RequestChannel
+import kafka.utils.Logging
+import kafka.server.KafkaRequestHandler.{threadCurrentRequest, threadRequestChannel}
+
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
-
 import com.yammer.metrics.core.Meter
 import org.apache.kafka.common.internals.FatalExitError
-import org.apache.kafka.common.utils.{KafkaThread, Time}
+import org.apache.kafka.common.utils.{Exit, KafkaThread, Time}
+import org.apache.kafka.server.common.RequestLocal
+import org.apache.kafka.server.metrics.KafkaMetricsGroup
 
 import scala.collection.mutable
+
+trait ApiRequestHandler {
+  def handle(request: RequestChannel.Request, requestLocal: RequestLocal): Unit
+  def tryCompleteActions(): Unit = {}
+}
+
+object KafkaRequestHandler {
+  // Support for scheduling callbacks on a request thread.
+  private val threadRequestChannel = new ThreadLocal[RequestChannel]
+  private val threadCurrentRequest = new ThreadLocal[RequestChannel.Request]
+
+  // For testing
+  @volatile private var bypassThreadCheck = false
+  def setBypassThreadCheck(bypassCheck: Boolean): Unit = {
+    bypassThreadCheck = bypassCheck
+  }
+
+  /**
+   * Creates a wrapped callback to be executed synchronously on the calling request thread or asynchronously
+   * on an arbitrary request thread.
+   * NOTE: this function must be originally called from a request thread.
+   * @param asyncCompletionCallback A callback method that we intend to call from the current thread or in another
+   *                                thread after an asynchronous action completes. The RequestLocal passed in must
+   *                                belong to the request handler thread that is executing the callback.
+   * @param requestLocal The RequestLocal for the current request handler thread in case we need to execute the callback
+   *                     function synchronously from the calling thread.
+   * @return Wrapped callback will either immediately execute `asyncCompletionCallback` or schedule it on an arbitrary request thread
+   *         depending on where it is called
+   */
+  def wrapAsyncCallback[T](asyncCompletionCallback: (RequestLocal, T) => Unit, requestLocal: RequestLocal): T => Unit = {
+    val requestChannel = threadRequestChannel.get()
+    val currentRequest = threadCurrentRequest.get()
+    if (requestChannel == null || currentRequest == null) {
+      if (!bypassThreadCheck)
+        throw new IllegalStateException("Attempted to reschedule to request handler thread from non-request handler thread.")
+      t => asyncCompletionCallback(requestLocal, t)
+    } else {
+      t => {
+        if (threadCurrentRequest.get() == currentRequest) {
+          // If the callback is actually executed on the same request thread, we can directly execute
+          // it without re-scheduling it.
+          asyncCompletionCallback(requestLocal, t)
+        } else {
+          // The requestChannel and request are captured in this lambda, so when it's executed on the callback thread
+          // we can re-schedule the original callback on a request thread and update the metrics accordingly.
+          requestChannel.sendCallbackRequest(RequestChannel.CallbackRequest(newRequestLocal => asyncCompletionCallback(newRequestLocal, t), currentRequest))
+        }
+      }
+    }
+  }
+}
 
 /**
  * A thread that answers kafka requests.
  */
-class KafkaRequestHandler(id: Int,
-                          brokerId: Int,
-                          val aggregateIdleMeter: Meter,
-                          val totalHandlerThreads: AtomicInteger,
-                          val requestChannel: RequestChannel,
-                          apis: KafkaApis,
-                          time: Time) extends Runnable with Logging {
-  this.logIdent = "[Kafka Request Handler " + id + " on Broker " + brokerId + "], "
+class KafkaRequestHandler(
+  id: Int,
+  brokerId: Int,
+  val aggregateIdleMeter: Meter,
+  val totalHandlerThreads: AtomicInteger,
+  val requestChannel: RequestChannel,
+  apis: ApiRequestHandler,
+  time: Time,
+  nodeName: String = "broker"
+) extends Runnable with Logging {
+  this.logIdent = s"[Kafka Request Handler $id on ${nodeName.capitalize} $brokerId], "
   private val shutdownComplete = new CountDownLatch(1)
+  private val requestLocal = RequestLocal.withThreadConfinedCaching
   @volatile private var stopped = false
 
-  def run() {
+  def run(): Unit = {
+    threadRequestChannel.set(requestChannel)
     while (!stopped) {
       // We use a single meter for aggregate idle percentage for the thread pool.
       // Since meter is calculated as total_recorded_value / time_window and
@@ -59,26 +117,68 @@ class KafkaRequestHandler(id: Int,
       req match {
         case RequestChannel.ShutdownRequest =>
           debug(s"Kafka request handler $id on broker $brokerId received shut down command")
-          shutdownComplete.countDown()
+          completeShutdown()
           return
+
+        case callback: RequestChannel.CallbackRequest =>
+          val originalRequest = callback.originalRequest
+          try {
+
+            // If we've already executed a callback for this request, reset the times and subtract the callback time from the 
+            // new dequeue time. This will allow calculation of multiple callback times.
+            // Otherwise, set dequeue time to now.
+            if (originalRequest.callbackRequestDequeueTimeNanos.isDefined) {
+              val prevCallbacksTimeNanos = originalRequest.callbackRequestCompleteTimeNanos.getOrElse(0L) - originalRequest.callbackRequestDequeueTimeNanos.getOrElse(0L)
+              originalRequest.callbackRequestCompleteTimeNanos = None
+              originalRequest.callbackRequestDequeueTimeNanos = Some(time.nanoseconds() - prevCallbacksTimeNanos)
+            } else {
+              originalRequest.callbackRequestDequeueTimeNanos = Some(time.nanoseconds())
+            }
+            
+            threadCurrentRequest.set(originalRequest)
+            callback.fun(requestLocal)
+          } catch {
+            case e: FatalExitError =>
+              completeShutdown()
+              Exit.exit(e.statusCode)
+            case e: Throwable => error("Exception when handling request", e)
+          } finally {
+            // When handling requests, we try to complete actions after, so we should try to do so here as well.
+            apis.tryCompleteActions()
+            if (originalRequest.callbackRequestCompleteTimeNanos.isEmpty)
+              originalRequest.callbackRequestCompleteTimeNanos = Some(time.nanoseconds())
+            threadCurrentRequest.remove()
+          }
 
         case request: RequestChannel.Request =>
           try {
             request.requestDequeueTimeNanos = endTime
             trace(s"Kafka request handler $id on broker $brokerId handling request $request")
-            apis.handle(request)
+            threadCurrentRequest.set(request)
+            apis.handle(request, requestLocal)
           } catch {
             case e: FatalExitError =>
-              shutdownComplete.countDown()
+              completeShutdown()
               Exit.exit(e.statusCode)
             case e: Throwable => error("Exception when handling request", e)
           } finally {
+            threadCurrentRequest.remove()
             request.releaseBuffer()
           }
+
+        case RequestChannel.WakeupRequest => 
+          // We should handle this in receiveRequest by polling callbackQueue.
+          warn("Received a wakeup request outside of typical usage.")
 
         case null => // continue
       }
     }
+    completeShutdown()
+  }
+
+  private def completeShutdown(): Unit = {
+    requestLocal.close()
+    threadRequestChannel.remove()
     shutdownComplete.countDown()
   }
 
@@ -92,17 +192,21 @@ class KafkaRequestHandler(id: Int,
 
 }
 
-class KafkaRequestHandlerPool(val brokerId: Int,
-                              val requestChannel: RequestChannel,
-                              val apis: KafkaApis,
-                              time: Time,
-                              numThreads: Int,
-                              requestHandlerAvgIdleMetricName: String,
-                              logAndThreadNamePrefix : String) extends Logging with KafkaMetricsGroup {
+class KafkaRequestHandlerPool(
+  val brokerId: Int,
+  val requestChannel: RequestChannel,
+  val apis: ApiRequestHandler,
+  time: Time,
+  numThreads: Int,
+  requestHandlerAvgIdleMetricName: String,
+  logAndThreadNamePrefix : String,
+  nodeName: String = "broker"
+) extends Logging {
+  private val metricsGroup = new KafkaMetricsGroup(this.getClass)
 
-  private val threadPoolSize: AtomicInteger = new AtomicInteger(numThreads)
+  val threadPoolSize: AtomicInteger = new AtomicInteger(numThreads)
   /* a meter to track the average free capacity of the request handlers */
-  private val aggregateIdleMeter = newMeter(requestHandlerAvgIdleMetricName, "percent", TimeUnit.NANOSECONDS)
+  private val aggregateIdleMeter = metricsGroup.newMeter(requestHandlerAvgIdleMetricName, "percent", TimeUnit.NANOSECONDS)
 
   this.logIdent = "[" + logAndThreadNamePrefix + " Kafka Request Handler on Broker " + brokerId + "], "
   val runnables = new mutable.ArrayBuffer[KafkaRequestHandler](numThreads)
@@ -111,7 +215,7 @@ class KafkaRequestHandlerPool(val brokerId: Int,
   }
 
   def createHandler(id: Int): Unit = synchronized {
-    runnables += new KafkaRequestHandler(id, brokerId, aggregateIdleMeter, threadPoolSize, requestChannel, apis, time)
+    runnables += new KafkaRequestHandler(id, brokerId, aggregateIdleMeter, threadPoolSize, requestChannel, apis, time, nodeName)
     KafkaThread.daemon(logAndThreadNamePrefix + "-kafka-request-handler-" + id, runnables(id)).start()
   }
 
@@ -138,150 +242,4 @@ class KafkaRequestHandlerPool(val brokerId: Int,
       handler.awaitShutdown()
     info("shut down completely")
   }
-}
-
-class BrokerTopicMetrics(name: Option[String]) extends KafkaMetricsGroup {
-  val tags: scala.collection.Map[String, String] = name match {
-    case None => Map.empty
-    case Some(topic) => Map("topic" -> topic)
-  }
-
-  // an internal map for "lazy initialization" of certain metrics
-  private val metricTypeMap = new Pool[String, Meter]
-
-  def messagesInRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.MessagesInPerSec,
-    newMeter(BrokerTopicStats.MessagesInPerSec, "messages", TimeUnit.SECONDS, tags))
-  def bytesInRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.BytesInPerSec,
-    newMeter(BrokerTopicStats.BytesInPerSec, "bytes", TimeUnit.SECONDS, tags))
-  def bytesOutRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.BytesOutPerSec,
-    newMeter(BrokerTopicStats.BytesOutPerSec, "bytes", TimeUnit.SECONDS, tags))
-  def bytesRejectedRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.BytesRejectedPerSec,
-    newMeter(BrokerTopicStats.BytesRejectedPerSec, "bytes", TimeUnit.SECONDS, tags))
-  private[server] def replicationBytesInRate =
-    if (name.isEmpty) Some(metricTypeMap.getAndMaybePut(
-      BrokerTopicStats.ReplicationBytesInPerSec,
-      newMeter(BrokerTopicStats.ReplicationBytesInPerSec, "bytes", TimeUnit.SECONDS, tags)))
-    else None
-  private[server] def replicationBytesOutRate =
-    if (name.isEmpty) Some(metricTypeMap.getAndMaybePut(
-      BrokerTopicStats.ReplicationBytesOutPerSec,
-      newMeter(BrokerTopicStats.ReplicationBytesOutPerSec, "bytes", TimeUnit.SECONDS, tags)))
-    else None
-  def failedProduceRequestRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.FailedProduceRequestsPerSec,
-    newMeter(BrokerTopicStats.FailedProduceRequestsPerSec, "requests", TimeUnit.SECONDS, tags))
-  def failedFetchRequestRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.FailedFetchRequestsPerSec,
-    newMeter(BrokerTopicStats.FailedFetchRequestsPerSec, "requests", TimeUnit.SECONDS, tags))
-  def totalProduceRequestRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.TotalProduceRequestsPerSec,
-    newMeter(BrokerTopicStats.TotalProduceRequestsPerSec, "requests", TimeUnit.SECONDS, tags))
-  def totalFetchRequestRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.TotalFetchRequestsPerSec,
-    newMeter(BrokerTopicStats.TotalFetchRequestsPerSec, "requests", TimeUnit.SECONDS, tags))
-  def fetchMessageConversionsRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.FetchMessageConversionsPerSec,
-    newMeter(BrokerTopicStats.FetchMessageConversionsPerSec, "requests", TimeUnit.SECONDS, tags))
-  def produceMessageConversionsRate = metricTypeMap.getAndMaybePut(BrokerTopicStats.ProduceMessageConversionsPerSec,
-    newMeter(BrokerTopicStats.ProduceMessageConversionsPerSec, "requests", TimeUnit.SECONDS, tags))
-
-  // this method helps check with metricTypeMap first before deleting a metric
-  def removeMetricHelper(metricType: String, tags: scala.collection.Map[String, String]): Unit = {
-    val metric: Meter = metricTypeMap.remove(metricType)
-    if (metric != null) {
-      removeMetric(metricType, tags)
-    }
-  }
-
-  def close() {
-    removeMetricHelper(BrokerTopicStats.MessagesInPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.BytesInPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.BytesOutPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.BytesRejectedPerSec, tags)
-    if (replicationBytesInRate.isDefined)
-      removeMetricHelper(BrokerTopicStats.ReplicationBytesInPerSec, tags)
-    if (replicationBytesOutRate.isDefined)
-      removeMetricHelper(BrokerTopicStats.ReplicationBytesOutPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.FailedProduceRequestsPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.FailedFetchRequestsPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.TotalProduceRequestsPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.TotalFetchRequestsPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.FetchMessageConversionsPerSec, tags)
-    removeMetricHelper(BrokerTopicStats.ProduceMessageConversionsPerSec, tags)
-  }
-}
-
-object BrokerTopicStats {
-  val MessagesInPerSec = "MessagesInPerSec"
-  val BytesInPerSec = "BytesInPerSec"
-  val BytesOutPerSec = "BytesOutPerSec"
-  val BytesRejectedPerSec = "BytesRejectedPerSec"
-  val ReplicationBytesInPerSec = "ReplicationBytesInPerSec"
-  val ReplicationBytesOutPerSec = "ReplicationBytesOutPerSec"
-  val FailedProduceRequestsPerSec = "FailedProduceRequestsPerSec"
-  val FailedFetchRequestsPerSec = "FailedFetchRequestsPerSec"
-  val TotalProduceRequestsPerSec = "TotalProduceRequestsPerSec"
-  val TotalFetchRequestsPerSec = "TotalFetchRequestsPerSec"
-  val FetchMessageConversionsPerSec = "FetchMessageConversionsPerSec"
-  val ProduceMessageConversionsPerSec = "ProduceMessageConversionsPerSec"
-  private val valueFactory = (k: String) => new BrokerTopicMetrics(Some(k))
-}
-
-class BrokerTopicStats {
-  import BrokerTopicStats._
-
-  private val stats = new Pool[String, BrokerTopicMetrics](Some(valueFactory))
-  val allTopicsStats = new BrokerTopicMetrics(None)
-
-  def topicStats(topic: String): BrokerTopicMetrics =
-    stats.getAndMaybePut(topic)
-
-  def updateReplicationBytesIn(value: Long) {
-    allTopicsStats.replicationBytesInRate.foreach { metric =>
-      metric.mark(value)
-    }
-  }
-
-  private def updateReplicationBytesOut(value: Long) {
-    allTopicsStats.replicationBytesOutRate.foreach { metric =>
-      metric.mark(value)
-    }
-  }
-
-  // This method only removes metrics only used for leader
-  def removeOldLeaderMetrics(topic: String) {
-    val topicMetrics = topicStats(topic)
-    if (topicMetrics != null) {
-      topicMetrics.removeMetricHelper(BrokerTopicStats.MessagesInPerSec, topicMetrics.tags)
-      topicMetrics.removeMetricHelper(BrokerTopicStats.BytesInPerSec, topicMetrics.tags)
-      topicMetrics.removeMetricHelper(BrokerTopicStats.BytesRejectedPerSec, topicMetrics.tags)
-      topicMetrics.removeMetricHelper(BrokerTopicStats.FailedProduceRequestsPerSec, topicMetrics.tags)
-      topicMetrics.removeMetricHelper(BrokerTopicStats.TotalProduceRequestsPerSec, topicMetrics.tags)
-      topicMetrics.removeMetricHelper(BrokerTopicStats.ProduceMessageConversionsPerSec, topicMetrics.tags)
-      topicMetrics.removeMetricHelper(BrokerTopicStats.ReplicationBytesOutPerSec, topicMetrics.tags)
-    }
-  }
-
-  // This method only removes metrics only used for follower
-  def removeOldFollowerMetrics(topic: String): Unit = {
-    val topicMetrics = topicStats(topic)
-    if (topicMetrics != null)
-      topicMetrics.removeMetricHelper(BrokerTopicStats.ReplicationBytesInPerSec, topicMetrics.tags)
-  }
-
-  def removeMetrics(topic: String) {
-    val metrics = stats.remove(topic)
-    if (metrics != null)
-      metrics.close()
-  }
-
-  def updateBytesOut(topic: String, isFollower: Boolean, value: Long) {
-    if (isFollower) {
-      updateReplicationBytesOut(value)
-    } else {
-      topicStats(topic).bytesOutRate.mark(value)
-      allTopicsStats.bytesOutRate.mark(value)
-    }
-  }
-
-  def close(): Unit = {
-    allTopicsStats.close()
-    stats.values.foreach(_.close())
-  }
-
 }

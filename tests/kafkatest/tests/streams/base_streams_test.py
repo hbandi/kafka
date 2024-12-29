@@ -27,8 +27,8 @@ class BaseStreamsTest(KafkaTest):
     Extends KafkaTest which manages setting up Kafka Cluster and Zookeeper
     see tests/kafkatest/tests/kafka_test.py for more info
     """
-    def __init__(self, test_context,  topics, num_zk=1, num_brokers=3):
-        super(BaseStreamsTest, self).__init__(test_context, num_zk, num_brokers, topics)
+    def __init__(self, test_context,  topics, num_controllers=1, num_brokers=3):
+        super(BaseStreamsTest, self).__init__(test_context, num_controllers, num_brokers, topics)
 
     def get_consumer(self, client_id, topic, num_messages):
         return VerifiableConsumer(self.test_context,
@@ -95,8 +95,11 @@ class BaseStreamsTest(KafkaTest):
                    timeout_sec=60,
                    err_msg="Did expect to read '%s' from %s" % (message, processor.node.account))
 
-    @staticmethod
-    def verify_from_file(processor, message, file):
+    def verify_from_file(self, processor, message, file):
         result = processor.node.account.ssh_output("grep -E '%s' %s | wc -l" % (message, file), allow_fail=False)
-        return int(result)
+        try:
+          return int(result)
+        except ValueError:
+          self.logger.warn("Command failed with ValueError: " + str(result, errors='strict'))
+          return 0
 

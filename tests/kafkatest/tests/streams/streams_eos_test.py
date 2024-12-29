@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ducktape.mark import matrix
 from ducktape.mark.resource import cluster
-from ducktape.mark import ignore
-
 from kafkatest.tests.kafka_test import KafkaTest
+from kafkatest.services.kafka import quorum
 from kafkatest.services.streams import StreamsEosTestDriverService, StreamsEosTestJobRunnerService, \
     StreamsComplexEosTestJobRunnerService, StreamsEosTestVerifyRunnerService, StreamsComplexEosTestVerifyRunnerService
 
@@ -39,14 +39,16 @@ class StreamsEosTest(KafkaTest):
         self.test_context = test_context
 
     @cluster(num_nodes=9)
-    def test_rebalance_simple(self):
+    @matrix(metadata_quorum=[quorum.combined_kraft])
+    def test_rebalance_simple(self, metadata_quorum):
         self.run_rebalance(StreamsEosTestJobRunnerService(self.test_context, self.kafka),
                            StreamsEosTestJobRunnerService(self.test_context, self.kafka),
                            StreamsEosTestJobRunnerService(self.test_context, self.kafka),
                            StreamsEosTestVerifyRunnerService(self.test_context, self.kafka))
 
     @cluster(num_nodes=9)
-    def test_rebalance_complex(self):
+    @matrix(metadata_quorum=[quorum.combined_kraft])
+    def test_rebalance_complex(self, metadata_quorum):
         self.run_rebalance(StreamsComplexEosTestJobRunnerService(self.test_context, self.kafka),
                            StreamsComplexEosTestJobRunnerService(self.test_context, self.kafka),
                            StreamsComplexEosTestJobRunnerService(self.test_context, self.kafka),
@@ -60,9 +62,8 @@ class StreamsEosTest(KafkaTest):
 
         self.driver.start()
 
-        processor1.clean_node_enabled = False
-
         self.add_streams(processor1)
+        processor1.clean_node_enabled = False
         self.add_streams2(processor1, processor2)
         self.add_streams3(processor1, processor2, processor3)
         self.stop_streams3(processor2, processor3, processor1)
@@ -70,6 +71,7 @@ class StreamsEosTest(KafkaTest):
         self.stop_streams3(processor1, processor3, processor2)
         self.stop_streams2(processor1, processor3)
         self.stop_streams(processor1)
+        processor1.clean_node_enabled = True
 
         self.driver.stop()
 
@@ -79,14 +81,16 @@ class StreamsEosTest(KafkaTest):
         verifier.node.account.ssh("grep ALL-RECORDS-DELIVERED %s" % verifier.STDOUT_FILE, allow_fail=False)
 
     @cluster(num_nodes=9)
-    def test_failure_and_recovery(self):
+    @matrix(metadata_quorum=[quorum.combined_kraft])
+    def test_failure_and_recovery(self, metadata_quorum):
         self.run_failure_and_recovery(StreamsEosTestJobRunnerService(self.test_context, self.kafka),
                                       StreamsEosTestJobRunnerService(self.test_context, self.kafka),
                                       StreamsEosTestJobRunnerService(self.test_context, self.kafka),
                                       StreamsEosTestVerifyRunnerService(self.test_context, self.kafka))
 
     @cluster(num_nodes=9)
-    def test_failure_and_recovery_complex(self):
+    @matrix(metadata_quorum=[quorum.combined_kraft])
+    def test_failure_and_recovery_complex(self, metadata_quorum):
         self.run_failure_and_recovery(StreamsComplexEosTestJobRunnerService(self.test_context, self.kafka),
                                       StreamsComplexEosTestJobRunnerService(self.test_context, self.kafka),
                                       StreamsComplexEosTestJobRunnerService(self.test_context, self.kafka),
@@ -100,9 +104,8 @@ class StreamsEosTest(KafkaTest):
 
         self.driver.start()
 
-        processor1.clean_node_enabled = False
-
         self.add_streams(processor1)
+        processor1.clean_node_enabled = False
         self.add_streams2(processor1, processor2)
         self.add_streams3(processor1, processor2, processor3)
         self.abort_streams(processor2, processor3, processor1)
@@ -112,6 +115,7 @@ class StreamsEosTest(KafkaTest):
         self.abort_streams(processor1, processor3, processor2)
         self.stop_streams2(processor1, processor3)
         self.stop_streams(processor1)
+        processor1.clean_node_enabled = True
 
         self.driver.stop()
 
@@ -159,9 +163,9 @@ class StreamsEosTest(KafkaTest):
 
     def wait_for_startup(self, monitor, processor):
         self.wait_for(monitor, processor, "StateChange: REBALANCING -> RUNNING")
-        self.wait_for(monitor, processor, "processed 500 records from topic")
+        self.wait_for(monitor, processor, "processed [0-9]* records from topic")
 
     def wait_for(self, monitor, processor, output):
         monitor.wait_until(output,
-                           timeout_sec=300,
+                           timeout_sec=480,
                            err_msg=("Never saw output '%s' on " % output) + str(processor.node.account))

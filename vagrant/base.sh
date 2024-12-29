@@ -18,7 +18,7 @@ set -ex
 
 # The version of Kibosh to use for testing.
 # If you update this, also update tests/docker/Dockerfile
-export KIBOSH_VERSION=d85ac3ec44be0700efe605c16289fd901cfdaa13
+export KIBOSH_VERSION=8841dd392e6fbf02986e2fb1f1ebf04df344b65a
 
 path_to_jdk_cache() {
   jdk_version=$1
@@ -32,12 +32,12 @@ fetch_jdk_tgz() {
 
   if [ ! -e $path ]; then
     mkdir -p $(dirname $path)
-    curl -s -L "https://s3-us-west-2.amazonaws.com/kafka-packages/jdk-${jdk_version}.tar.gz" -o $path
+    curl --retry 5 -s -L "https://s3-us-west-2.amazonaws.com/kafka-packages/jdk-${jdk_version}.tar.gz" -o $path
   fi
 }
 
-JDK_MAJOR="${JDK_MAJOR:-8}"
-JDK_FULL="${JDK_FULL:-8u202-linux-x64}"
+JDK_MAJOR="${JDK_MAJOR:-17}"
+JDK_FULL="${JDK_FULL:-17-linux-x64}"
 
 if [ -z `which javac` ]; then
     apt-get -y update
@@ -79,8 +79,8 @@ get_kafka() {
     url_streams_test=https://s3-us-west-2.amazonaws.com/kafka-packages/kafka-streams-$version-test.jar
     if [ ! -d /opt/kafka-$version ]; then
         pushd /tmp
-        curl -O $url
-        curl -O $url_streams_test || true
+        curl --retry 5 -O $url
+        curl --retry 5 -O $url_streams_test || true
         file_tgz=`basename $url`
         file_streams_jar=`basename $url_streams_test` || true
         tar -xzf $file_tgz
@@ -107,20 +107,15 @@ popd
 popd
 popd
 
+# Install iperf
+apt-get install -y iperf traceroute
+
 # Test multiple Kafka versions
 # We want to use the latest Scala version per Kafka version
 # Previously we could not pull in Scala 2.12 builds, because Scala 2.12 requires Java 8 and we were running the system
 # tests with Java 7. We have since switched to Java 8, so 2.0.0 and later use Scala 2.12.
-get_kafka 0.8.2.2 2.11
-chmod a+rw /opt/kafka-0.8.2.2
-get_kafka 0.9.0.1 2.11
-chmod a+rw /opt/kafka-0.9.0.1
-get_kafka 0.10.0.1 2.11
-chmod a+rw /opt/kafka-0.10.0.1
-get_kafka 0.10.1.1 2.11
-chmod a+rw /opt/kafka-0.10.1.1
-get_kafka 0.10.2.2 2.11
-chmod a+rw /opt/kafka-0.10.2.2
+# The versions between 0.11.0.3 and 2.0.1 are used to run client code, because zookeeper in these versions is not compatible with JDK 17.
+# See KAFKA-17888 for more details.
 get_kafka 0.11.0.3 2.11
 chmod a+rw /opt/kafka-0.11.0.3
 get_kafka 1.0.2 2.11
@@ -129,14 +124,64 @@ get_kafka 1.1.1 2.11
 chmod a+rw /opt/kafka-1.1.1
 get_kafka 2.0.1 2.12
 chmod a+rw /opt/kafka-2.0.1
-get_kafka 2.1.0 2.12
-chmod a+rw /opt/kafka-2.1.0
 get_kafka 2.1.1 2.12
 chmod a+rw /opt/kafka-2.1.1
-get_kafka 2.2.0 2.12
-chmod a+rw /opt/kafka-2.2.0
-get_kafka 2.3.0 2.12
-chmod a+rw /opt/kafka-2.3.0
+get_kafka 2.2.2 2.12
+chmod a+rw /opt/kafka-2.2.2
+get_kafka 2.3.1 2.12
+chmod a+rw /opt/kafka-2.3.1
+get_kafka 2.4.1 2.12
+chmod a+rw /opt/kafka-2.4.1
+get_kafka 2.5.1 2.12
+chmod a+rw /opt/kafka-2.5.1
+get_kafka 2.6.3 2.12
+chmod a+rw /opt/kafka-2.6.3
+get_kafka 2.7.2 2.12
+chmod a+rw /opt/kafka-2.7.2
+get_kafka 2.8.2 2.12
+chmod a+rw /opt/kafka-2.8.2
+get_kafka 3.0.2 2.12
+chmod a+rw /opt/kafka-3.0.2
+get_kafka 3.1.2 2.12
+chmod a+rw /opt/kafka-3.1.2
+get_kafka 3.2.3 2.12
+chmod a+rw /opt/kafka-3.2.3
+get_kafka 3.3.2 2.12
+chmod a+rw /opt/kafka-3.3.2
+get_kafka 3.4.1 2.12
+chmod a+rw /opt/kafka-3.4.1
+get_kafka 3.5.2 2.12
+chmod a+rw /opt/kafka-3.5.2
+get_kafka 3.6.2 2.12
+chmod a+rw /opt/kafka-3.6.2
+get_kafka 3.7.2 2.12
+chmod a+rw /opt/kafka-3.7.2
+get_kafka 3.8.1 2.12
+chmod a+rw /opt/kafka-3.8.1
+get_kafka 3.9.0 2.12
+chmod a+rw /opt/kafka-3.9.0
+
+# To ensure the Kafka cluster starts successfully under JDK 17, we need to update the Zookeeper
+# client from version 3.4.x to 3.5.7 in Kafka versions 2.1.1, 2.2.2, and 2.3.1, as the older Zookeeper
+# client is incompatible with JDK 17. See KAFKA-17888 for more details.
+curl -s "https://repo1.maven.org/maven2/org/apache/zookeeper/zookeeper/3.5.7/zookeeper-3.5.7.jar" -o /opt/zookeeper-3.5.7.jar
+curl -s "https://repo1.maven.org/maven2/org/apache/zookeeper/zookeeper-jute/3.5.7/zookeeper-jute-3.5.7.jar" -o /opt/zookeeper-jute-3.5.7.jar
+rm -f /opt/kafka-2.1.1/libs/zookeeper-*
+rm -f /opt/kafka-2.2.2/libs/zookeeper-*
+rm -f /opt/kafka-2.3.1/libs/zookeeper-*
+
+cp /opt/zookeeper-3.5.7.jar /opt/kafka-2.1.1/libs/zookeeper-3.5.7.jar
+chmod a+rw /opt/kafka-2.1.1/libs/zookeeper-3.5.7.jar
+cp /opt/zookeeper-3.5.7.jar /opt/kafka-2.2.2/libs/zookeeper-3.5.7.jar
+chmod a+rw /opt/kafka-2.2.2/libs/zookeeper-3.5.7.jar
+cp /opt/zookeeper-3.5.7.jar /opt/kafka-2.3.1/libs/zookeeper-3.5.7.jar
+chmod a+rw /opt/kafka-2.3.1/libs/zookeeper-3.5.7.jar
+cp /opt/zookeeper-jute-3.5.7.jar /opt/kafka-2.1.1/libs/zookeeper-jute-3.5.7.jar
+chmod a+rw /opt/kafka-2.1.1/libs/zookeeper-jute-3.5.7.jar
+cp /opt/zookeeper-jute-3.5.7.jar /opt/kafka-2.2.2/libs/zookeeper-jute-3.5.7.jar
+chmod a+rw /opt/kafka-2.2.2/libs/zookeeper-jute-3.5.7.jar
+cp /opt/zookeeper-jute-3.5.7.jar /opt/kafka-2.3.1/libs/zookeeper-jute-3.5.7.jar
+chmod a+rw /opt/kafka-2.3.1/libs/zookeeper-jute-3.5.7.jar
 
 # For EC2 nodes, we want to use /mnt, which should have the local disk. On local
 # VMs, we can just create it if it doesn't exist and use it like we'd use
@@ -152,3 +197,11 @@ chmod a+rwx /mnt
 ntpdate -u pool.ntp.org
 # Install ntp daemon - it will automatically start on boot
 apt-get -y install ntp
+
+# Increase the ulimit
+mkdir -p /etc/security/limits.d
+echo "* soft nofile 128000" >> /etc/security/limits.d/nofile.conf
+echo "* hard nofile 128000" >> /etc/security/limits.d/nofile.conf
+
+ulimit -Hn 128000
+ulimit -Sn 128000

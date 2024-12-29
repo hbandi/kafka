@@ -21,12 +21,14 @@ import org.apache.kafka.common.message.ListPartitionReassignmentsResponseData;
 import org.apache.kafka.common.message.ListPartitionReassignmentsResponseData.OngoingPartitionReassignment;
 import org.apache.kafka.common.message.ListPartitionReassignmentsResponseData.OngoingTopicReassignment;
 import org.apache.kafka.common.protocol.ApiKeys;
-import org.apache.kafka.common.protocol.types.Struct;
+import org.apache.kafka.common.protocol.ByteBufferAccessor;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import static org.apache.kafka.common.message.ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics;
 
 public class ListPartitionReassignmentsRequest extends AbstractRequest {
 
@@ -49,51 +51,38 @@ public class ListPartitionReassignmentsRequest extends AbstractRequest {
         }
     }
 
-    private ListPartitionReassignmentsRequestData data;
-    private final short version;
+    private final ListPartitionReassignmentsRequestData data;
 
     private ListPartitionReassignmentsRequest(ListPartitionReassignmentsRequestData data, short version) {
         super(ApiKeys.LIST_PARTITION_REASSIGNMENTS, version);
         this.data = data;
-        this.version = version;
-    }
-
-    ListPartitionReassignmentsRequest(Struct struct, short version) {
-        super(ApiKeys.LIST_PARTITION_REASSIGNMENTS, version);
-        this.data = new ListPartitionReassignmentsRequestData(struct, version);
-        this.version = version;
     }
 
     public static ListPartitionReassignmentsRequest parse(ByteBuffer buffer, short version) {
-        return new ListPartitionReassignmentsRequest(
-                ApiKeys.LIST_PARTITION_REASSIGNMENTS.parseRequest(version, buffer), version
-        );
+        return new ListPartitionReassignmentsRequest(new ListPartitionReassignmentsRequestData(
+            new ByteBufferAccessor(buffer), version), version);
     }
 
+    @Override
     public ListPartitionReassignmentsRequestData data() {
         return data;
-    }
-
-    /**
-     * Visible for testing.
-     */
-    @Override
-    public Struct toStruct() {
-        return data.toStruct(version);
     }
 
     @Override
     public AbstractResponse getErrorResponse(int throttleTimeMs, Throwable e) {
         ApiError apiError = ApiError.fromThrowable(e);
 
-        List<OngoingTopicReassignment> ongoingTopicReassignments = data.topics().stream().map(topic ->
-                new OngoingTopicReassignment()
-                        .setName(topic.name())
-                        .setPartitions(topic.partitionIndexes().stream().map(partitionIndex ->
-                                new OngoingPartitionReassignment().setPartitionIndex(partitionIndex)).collect(Collectors.toList())
-                        )
-        ).collect(Collectors.toList());
-
+        List<OngoingTopicReassignment> ongoingTopicReassignments = new ArrayList<>();
+        if (data.topics() != null) {
+            for (ListPartitionReassignmentsTopics topic : data.topics()) {
+                ongoingTopicReassignments.add(
+                        new OngoingTopicReassignment()
+                                .setName(topic.name())
+                                .setPartitions(topic.partitionIndexes().stream().map(partitionIndex ->
+                                        new OngoingPartitionReassignment().setPartitionIndex(partitionIndex)).collect(Collectors.toList()))
+                );
+            }
+        }
         ListPartitionReassignmentsResponseData responseData = new ListPartitionReassignmentsResponseData()
                 .setTopics(ongoingTopicReassignments)
                 .setErrorCode(apiError.error().code())

@@ -19,6 +19,7 @@ package org.apache.kafka.streams.tests;
 
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.utils.Exit;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.KafkaStreams.State;
@@ -29,11 +30,11 @@ import org.apache.kafka.streams.kstream.Aggregator;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.Initializer;
 import org.apache.kafka.streams.kstream.JoinWindows;
-import org.apache.kafka.streams.kstream.Joined;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.Reducer;
+import org.apache.kafka.streams.kstream.StreamJoined;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -46,8 +47,8 @@ import java.util.regex.Pattern;
 
 import static java.time.Duration.ofMillis;
 
+@SuppressWarnings("deprecation")
 public class StreamsOptimizedTest {
-
 
     public static void main(final String[] args) throws Exception {
         if (args.length < 1) {
@@ -89,27 +90,27 @@ public class StreamsOptimizedTest {
             aggregator,
             Materialized.with(Serdes.String(), Serdes.Integer()))
             .toStream()
-            .peek((k, v) -> System.out.println(String.format("AGGREGATED key=%s value=%s", k, v)))
+            .peek((k, v) -> System.out.printf("AGGREGATED key=%s value=%s%n", k, v))
             .to(aggregationTopic, Produced.with(Serdes.String(), Serdes.Integer()));
 
 
         mappedStream.groupByKey()
             .reduce(reducer, Materialized.with(Serdes.String(), Serdes.String()))
             .toStream()
-            .peek((k, v) -> System.out.println(String.format("REDUCED key=%s value=%s", k, v)))
+            .peek((k, v) -> System.out.printf("REDUCED key=%s value=%s%n", k, v))
             .to(reduceTopic, Produced.with(Serdes.String(), Serdes.String()));
 
         mappedStream.join(countStream, (v1, v2) -> v1 + ":" + v2.toString(),
             JoinWindows.of(ofMillis(500)),
-            Joined.with(Serdes.String(), Serdes.String(), Serdes.Long()))
-            .peek((k, v) -> System.out.println(String.format("JOINED key=%s value=%s", k, v)))
+            StreamJoined.with(Serdes.String(), Serdes.String(), Serdes.Long()))
+            .peek((k, v) -> System.out.printf("JOINED key=%s value=%s%n", k, v))
             .to(joinTopic, Produced.with(Serdes.String(), Serdes.String()));
 
         final Properties config = new Properties();
 
 
         config.setProperty(StreamsConfig.APPLICATION_ID_CONFIG, "StreamsOptimizedTest");
-        config.setProperty(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, "0");
+        config.setProperty(StreamsConfig.STATESTORE_CACHE_MAX_BYTES_CONFIG, "0");
         config.setProperty(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
         config.setProperty(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
         config.setProperty(StreamsConfig.adminClientPrefix(AdminClientConfig.RETRIES_CONFIG), "100");
@@ -124,22 +125,20 @@ public class StreamsOptimizedTest {
         streams.setStateListener((newState, oldState) -> {
             if (oldState == State.REBALANCING && newState == State.RUNNING) {
                 final int repartitionTopicCount = getCountOfRepartitionTopicsFound(topology.describe().toString(), repartitionTopicPattern);
-                System.out.println(String.format("REBALANCING -> RUNNING with REPARTITION TOPIC COUNT=%d", repartitionTopicCount));
+                System.out.printf("REBALANCING -> RUNNING with REPARTITION TOPIC COUNT=%d%n", repartitionTopicCount);
                 System.out.flush();
             }
         });
 
+        streams.cleanUp();
         streams.start();
 
-        Runtime.getRuntime().addShutdownHook(new Thread() {
-            @Override
-            public void run() {
-                System.out.println("closing Kafka Streams instance");
-                System.out.flush();
-                streams.close(Duration.ofMillis(5000));
-                System.out.println("OPTIMIZE_TEST Streams Stopped");
-                System.out.flush();
-            }
+        Exit.addShutdownHook("streams-shutdown-hook", () -> {
+            System.out.println("closing Kafka Streams instance");
+            System.out.flush();
+            streams.close(Duration.ofMillis(5000));
+            System.out.println("OPTIMIZE_TEST Streams Stopped");
+            System.out.flush();
         });
 
     }
@@ -150,7 +149,7 @@ public class StreamsOptimizedTest {
         final List<String> repartitionTopicsFound = new ArrayList<>();
         while (matcher.find()) {
             final String repartitionTopic = matcher.group();
-            System.out.println(String.format("REPARTITION TOPIC found -> %s", repartitionTopic));
+            System.out.printf("REPARTITION TOPIC found -> %s%n", repartitionTopic);
             repartitionTopicsFound.add(repartitionTopic);
         }
         return repartitionTopicsFound.size();
